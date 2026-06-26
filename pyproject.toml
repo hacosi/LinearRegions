@@ -1,0 +1,26 @@
+[project]
+name = "adam-experiments"
+version = "0.1.0"
+description = "ML experiment runner for comparing optimizers across tasks"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "numpy>=1.24",
+    "matplotlib>=3.10.8",
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "auto-LiRPA",
+    "onnx>=1.15",
+    "onnxruntime>=1.17",
+]
+
+[project.scripts]
+run-experiment = "run_experiment:main"
+run-verification = "run_verification:main"
+
+[tool.uv.sources]
+# Modern auto_LiRPA (BoundedModule / CROWN-Optimized API) is not on PyPI;
+# the PyPI `auto-lirpa` caps at 0.3 (2021). Latest supports Python 3.11 only,
+# which is why this project pins requires-python to >=3.11,<3.12.
+auto-LiRPA = { git = "https://github.com/Verified-Intelligence/auto_LiRPA.git" }
