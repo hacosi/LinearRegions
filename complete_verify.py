@@ -43,13 +43,16 @@ import torch
 def export_onnx(model, input_dim, path, device="cpu"):
     """Export an MLP to ONNX with a fixed (1, input_dim) input.
 
-    The example input is already flat, so the model's internal view() is a
-    no-op and the exported graph is a clean Linear/ReLU stack.
+    We export the underlying Linear/ReLU stack (`model.network`) directly rather
+    than the wrapper, so the graph contains no Flatten/Reshape from the model's
+    internal view().  A pure Gemm/Relu chain imports cleanly into the
+    onnx2pytorch frontend that alpha,beta-CROWN uses; a leading Reshape there
+    triggers shape-inference errors.
     """
-    model = model.to(device).eval()
+    net = model.network.to(device).eval()  # nn.Linear (depth 0) or nn.Sequential
     example = torch.zeros(1, input_dim, device=device)
     torch.onnx.export(
-        model, example, path,
+        net, example, path,
         input_names=["input"], output_names=["output"],
         opset_version=13, dynamo=False,
     )
@@ -89,13 +92,15 @@ def write_vnnlib(path, x, y, eps, num_classes, input_lo=None, input_hi=None):
         lines.append(f"(assert (<= X_{i} {hi:.8f}))")
     lines.append("")
 
-    # Unsafe output condition: OR_j (Y_j - Y_y >= 0), j != y.
+    # Unsafe output condition: OR_j (Y_j >= Y_y), j != y.  Emitted in the
+    # disjunctive-normal form abcrown's read_vnnlib expects, i.e. each disjunct
+    # wrapped in (and ...):  (assert (or (and (>= Y_0 Y_y))(and (>= Y_1 Y_y))...))
     others = [k for k in range(num_classes) if k != y]
     if len(others) == 1:
         j = others[0]
         lines.append(f"(assert (>= Y_{j} Y_{y}))")
     else:
-        clause = " ".join(f"(>= Y_{j} Y_{y})" for j in others)
+        clause = "".join(f"(and (>= Y_{j} Y_{y}))" for j in others)
         lines.append(f"(assert (or {clause}))")
     lines.append("")
 
@@ -149,31 +154,48 @@ def is_available():
     return find_abcrown()[1] is not None
 
 
-_STATUS_RE = re.compile(r"\b(verified|safe|holds|unsat)\b", re.I)
-_FALSIFIED_RE = re.compile(r"\b(falsified|unsafe|violated|sat)\b", re.I)
-_TIMEOUT_RE = re.compile(r"\b(timeout|timed out|unknown)\b", re.I)
-# alpha,beta-CROWN prints e.g. "Number of visited domains: 1234".
-_BRANCH_RE = re.compile(r"(?:visited|total)\s+(?:domains|branches)\D*(\d+)", re.I)
-_TIME_RE = re.compile(r"(?:Total|verification)\s+time\D*([0-9.]+)", re.I)
+# abcrown prints a final "Result: <verified_status>" line (abcrown.py) and a
+# "<N> domains visited" line per branch-and-bound run (bab.py).
+_RESULT_RE = re.compile(r"Result:\s*(\S+)", re.I)
+_TIME_RE = re.compile(r"\bTime:\s*([0-9.]+)", re.I)
+_BRANCH_RE = re.compile(r"(\d+)\s+domains\s+visited", re.I)
+_INIT_SOLVED_RE = re.compile(r"initial CROWN|init bound", re.I)
+
+# Map abcrown's verified_status tokens to our three outcomes.
+_VERIFIED = {"unsat", "safe", "holds", "verified"}
+_FALSIFIED = {"sat", "unsafe", "violated", "falsified"}
 
 
 def _parse_output(text):
-    """Extract (status, num_branchings, verification_time) from CLI output."""
-    branch = _BRANCH_RE.search(text)
-    vtime = _TIME_RE.search(text)
-    # Order matters: check falsified/timeout before the broad 'verified' regex.
-    if _FALSIFIED_RE.search(text):
-        status = "falsified"
-    elif _TIMEOUT_RE.search(text):
-        status = "timeout"
-    elif _STATUS_RE.search(text):
+    """Extract (status, num_branchings, verification_time) from CLI output.
+
+    Reads the *final* "Result:" line (intermediate logs contain a misleading
+    'verified_status unknown'); branch count is the max "<N> domains visited".
+    """
+    results = _RESULT_RE.findall(text)
+    token = results[-1].lower() if results else ""
+    if token in _VERIFIED:
         status = "verified"
+    elif token in _FALSIFIED:
+        status = "falsified"
+    elif token in ("timeout", "unknown"):
+        status = token
     else:
         status = "unknown"
+
+    branches = [int(n) for n in _BRANCH_RE.findall(text)]
+    if branches:
+        num_branchings = max(branches)
+    elif status == "verified" and _INIT_SOLVED_RE.search(text):
+        num_branchings = 0          # solved at the initial CROWN bound, no BaB
+    else:
+        num_branchings = None
+
+    times = _TIME_RE.findall(text)
     return {
         "status": status,
-        "num_branchings": int(branch.group(1)) if branch else None,
-        "verification_time": float(vtime.group(1)) if vtime else None,
+        "num_branchings": num_branchings,
+        "verification_time": float(times[-1]) if times else None,
     }
 
 
@@ -204,9 +226,16 @@ def run_complete(model, x, y, eps, num_classes, input_dim=None,
     write_config(cfg_path, onnx_path, vnnlib_path, timeout=timeout, device=device)
 
     cmd = ([python, target] if python else [target]) + ["--config", cfg_path]
+
+    # The abcrown install ships a pinned auto_LiRPA submodule; prefer it over any
+    # auto_LiRPA installed in the calling interpreter via ABCROWN_PYTHONPATH.
+    env = os.environ.copy()
+    extra_pp = os.environ.get("ABCROWN_PYTHONPATH")
+    if extra_pp:
+        env["PYTHONPATH"] = extra_pp + os.pathsep + env.get("PYTHONPATH", "")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout + 60)
+                              timeout=timeout + 60, env=env)
     except subprocess.TimeoutExpired:
         return {"status": "timeout", "num_branchings": None,
                 "verification_time": float(timeout)}
@@ -247,12 +276,14 @@ def _selftest():
     spec = open(vnnlib_path).read()
     assert f"declare-const X_{D-1}" in spec and f"Y_{K-1}" in spec
 
-    # Output parser on a synthetic "verified" log.
-    parsed = _parse_output("Result: verified\nNumber of visited domains: 42\n"
-                           "Total time: 1.23")
-    assert parsed["status"] == "verified"
-    assert parsed["num_branchings"] == 42
-    assert abs(parsed["verification_time"] - 1.23) < 1e-6
+    # Output parser on a synthetic log in abcrown's real format.
+    parsed = _parse_output("verified_status unknown\n42 domains visited\n"
+                           "Result: unsat\nTime: 1.23")
+    assert parsed["status"] == "verified", parsed
+    assert parsed["num_branchings"] == 42, parsed
+    assert abs(parsed["verification_time"] - 1.23) < 1e-6, parsed
+    # Falsified ('sat') must not be confused with 'unsat'.
+    assert _parse_output("Result: sat\nTime: 0.5")["status"] == "falsified"
 
     print(f"selftest OK | onnx/torch max_diff={max_diff:.2e} | "
           f"abcrown available={is_available()}")

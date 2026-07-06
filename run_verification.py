@@ -76,6 +76,8 @@ def parse_args():
     p.add_argument("--complete_eps", type=float, default=None,
                    help="eps for the complete tier (default: median of --eps)")
     p.add_argument("--complete_timeout", type=int, default=120)
+    p.add_argument("--complete_n_points", type=int, default=10,
+                   help="Points for the (expensive) complete tier; capped at --n_points")
 
     p.add_argument("--seed0", type=int, default=0, help="First seed (seeds are seed0..seed0+N-1)")
     p.add_argument("--device", default="auto", help="cpu | cuda | mps | auto")
@@ -172,11 +174,11 @@ def verify_model(model, test_ds, point_idxs, args, num_classes, input_dim,
             model, x, y, num_classes, eps_max=args.eps_max, method="CROWN",
             bounded_model=bounded, input_dim=input_dim))
 
-    # ---- complete tier (optional) ----
+    # ---- complete tier (optional, capped at complete_n_points) ----
     complete = None
     if args.complete:
         complete = []
-        for idx, (x, y) in zip(point_idxs, pts):
+        for idx, (x, y) in list(zip(point_idxs, pts))[:args.complete_n_points]:
             res = CV.run_complete(model, x, y, complete_eps, num_classes,
                                   input_dim=input_dim, timeout=args.complete_timeout)
             res["point"] = idx
@@ -213,7 +215,26 @@ def main():
     num_classes = task_info.get("num_classes", task_info["output_dim"])
     input_dim = task_info["input_dim"]
 
+    # Output file is created up front and rewritten after every model, so an
+    # interrupted run keeps all completed (seed, optimizer) records.
+    os.makedirs(args.out_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = os.path.join(
+        args.out_dir,
+        f"verify_{args.task}_w{args.width}_d{args.depth}_s{args.seeds}_{ts}.json")
+
     models_out = []
+
+    def flush():
+        output = {
+            "config": {**vars(args), "device": str(device), "complete_eps": complete_eps},
+            "task_info": task_info,
+            "models": models_out,
+            "timestamp": datetime.now().isoformat(),
+        }
+        with open(fname, "w") as f:
+            json.dump(output, f, indent=2)
+
     for s in range(args.seed0, args.seed0 + args.seeds):
         # Identical initialization for the matched pair.
         torch.manual_seed(s)
@@ -247,27 +268,21 @@ def main():
                 **vres,
             }
             models_out.append(rec)
+            flush()  # persist after every model
+            cstat = ""
+            if vres["complete"]:
+                nb = [c.get("num_branchings") for c in vres["complete"]
+                      if c.get("num_branchings") is not None]
+                vr = sum(c["status"] == "verified" for c in vres["complete"])
+                cstat = (f" complete[verified={vr}/{len(vres['complete'])} "
+                         f"mean_branch={sum(nb)/len(nb):.1f}]" if nb else
+                         f" complete[verified={vr}/{len(vres['complete'])}]")
             print(f"  test_acc={rec['test_acc']:.4f} lipschitz={lipschitz:.3g} "
                   f"local_regions={local_regions:.1f} "
                   f"unstable@{args.eps[0]}={vres['per_eps'][0]['unstable_mean']:.1f} "
-                  f"crown_radius_mean={vres['crown_radius_mean']:.4f}")
+                  f"crown_radius_mean={vres['crown_radius_mean']:.4f}{cstat}")
 
-    # ---- save ----
-    os.makedirs(args.out_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = os.path.join(
-        args.out_dir,
-        f"verify_{args.task}_w{args.width}_d{args.depth}_s{args.seeds}_{ts}.json")
-    output = {
-        "config": {**vars(args), "device": str(device), "complete_eps": complete_eps},
-        "task_info": task_info,
-        "models": models_out,
-        "timestamp": datetime.now().isoformat(),
-    }
-    with open(fname, "w") as f:
-        json.dump(output, f, indent=2)
     print(f"\nResults saved to {fname}")
-
     _print_summary(models_out, args.eps)
 
 
