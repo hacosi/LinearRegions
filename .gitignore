@@ -5,3 +5,7 @@ results_verification/
 figs/
 __pycache__/
 *.egg-info/
+
+.DS_Store
+logs/
+out.txt
