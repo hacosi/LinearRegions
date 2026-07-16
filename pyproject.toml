@@ -18,6 +18,7 @@ dependencies = [
 [project.scripts]
 run-experiment = "run_experiment:main"
 run-verification = "run_verification:main"
+run-pruning = "run_pruning:main"
 
 [tool.uv.sources]
 # Modern auto_LiRPA (BoundedModule / CROWN-Optimized API) is not on PyPI;

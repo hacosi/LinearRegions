@@ -36,6 +36,14 @@ experiment below.
 | `verification.py` | IBP toolkit (`count_unstable_neurons`, `certified_radius`, …) + auto_LiRPA CROWN tier (`certified_robust_crown`, `certified_radius_crown`) + `lipschitz_product`. |
 | `complete_verify.py` | α,β-CROWN complete-verifier integration (ONNX + VNNLIB export, `abcrown` CLI subprocess); guarded — skips if the CLI is absent. |
 | `analysis_verification.py` | Loads `results_verification/*.json` and produces the Phase 1–3 figures. |
+| `run_pruning.py` | CLI entry point (`run-pruning`) for the compressibility experiment. Trains matched Adam/SGD pairs, sweeps pruning + quantization frontiers, writes JSON to `results_pruning/`. |
+| `pruning.py` | Compression toolkit (`global_magnitude_mask`, `quantize_weights_`, `finetune_with_masks`, `evaluate`, `lipschitz_product`); dependency-free. |
+| `analysis_pruning.py` | Loads `results_pruning/*.json` and produces the pruning/quantization frontier + mechanism figures. |
+| `sanity_bullseye_regions.py` | Quick matched-init Adam/SGD sanity check: exact region count vs training on bullseye. |
+| `run_region_sweep.py` | Exact region-tracking sweep over depth×width×seed on a low-D task; writes `results_regions/`. |
+| `analysis_region_sweep.py` | Region-vs-epoch grid, final-regions vs depth/width, SGD−Adam gap heatmap, accuracy parity. |
+| `run_causal_sweep.py` | Causal-mediation study: intervene on region count via 4 knobs; record regions + Lipschitz + compressibility + verifiability; writes `results_causal/`. |
+| `analysis_causal.py` | Dose-response, mediation scatter (shared curve), partial regression, matched-region-bin test. |
 
 ## Tasks (`datasets.py`)
 
@@ -123,3 +131,98 @@ export ABCROWN_PYTHON=/path/to/that/env/bin/python   # optional; defaults to cur
 
 `complete_verify.py` self-tests its dependency-free parts (ONNX export, VNNLIB, output parsing)
 via `uv run python complete_verify.py`.
+
+## Compressibility experiment (`run_pruning.py`)
+
+Tests the claim (see `applications.md` idea #3) that Adam's lower local linear-region density —
+fewer effective degrees of freedom — makes networks **more compressible**. Trains matched
+Adam/SGD pairs from **identical initialization per seed** (only the optimizer differs), then
+measures two frontiers per model:
+
+1. **Pruning** — over a sparsity grid (`--sparsities`), for each criterion in `--methods`:
+   `magnitude` (global magnitude, scale-*sensitive* baseline), `magnitude_local` (per-layer
+   threshold), `sensitivity` (`|w·∂L/∂w|`, data-driven, ~scale-invariant), `synflow` (SynFlow
+   saliency on the trained weights, scale-invariant), `structured` (remove whole hidden neurons
+   → directly deletes ReLU hinges; sparsity = neuron fraction). Records **one-shot** accuracy for
+   all; **fine-tuned** (mask-pinned, `--finetune_epochs`) only for methods in `--finetune_methods`
+   (default `magnitude`). Every criterion is run on both the raw weights and a spectral-norm
+   **balanced** copy (`--skip_balance` to disable) — see the scale control below.
+2. **Quantization** — per-tensor symmetric uniform weight quantization over a bit-width grid
+   (`--bits`), unbalanced arm only; skip with `--skip_quant`.
+
+**Scale control (the key addition):** `pruning.balance_spectral_norms_` applies a
+*function-preserving* spectral-norm equalization (ReLU positive-homogeneity — leaves the function,
+accuracy, and Lipschitz product exactly unchanged, only redistributing per-layer scale). Global
+magnitude pruning is fooled by cross-layer scale imbalance; comparing the `balanced` vs
+`unbalanced` arm — and the scale-invariant criteria vs `magnitude` — isolates a genuine
+region-count effect from the weight-scale confound that dominated Phase 1 (Adam's Lipschitz was
+~3× SGD's, cancelling its fewer-regions advantage).
+
+Summary scalars per model: `max_sparsity[arm][method]` and `min_bits_at_drop` — the most
+aggressive compression tolerated within `--acc_drop` of the dense accuracy.
+
+```bash
+# Fast smoke test (all criteria, both arms):
+uv run python run_pruning.py --task bullseye --seeds 2 --epochs 5 --finetune_epochs 2
+# Full MNIST run:
+uv run python run_pruning.py --task mnist --seeds 5 --epochs 15
+uv run python analysis_pruning.py --save figs             # frontier grid + A/B + mechanism
+```
+
+Output JSON → `results_pruning/`, one record per (seed, optimizer) with
+`prune_frontiers[arm][method]` (per-sparsity one-shot + fine-tuned accuracy), `quant_frontier`,
+`max_sparsity[arm][method]` / `min_bits_at_drop`, plus `lipschitz` and `local_region_count`.
+Same discipline as the verification experiment: **matched initialization**, **accuracy matching**
+(the script prints both optimizers' accuracy), and the **Lipschitz** / balancing controls.
+
+`pruning.py` self-tests its parts (per-method sparsity, SynFlow weight-restore, structured neuron
+removal, balance function/Lipschitz preservation, quantization, `evaluate`) via
+`uv run python pruning.py`.
+
+## Region-tracking sweep (`run_region_sweep.py`)
+
+Maps the "Adam carves fewer regions than SGD" effect across architecture on a low-D task where
+regions are counted **exactly** (`count_regions(method="grid")`). For each depth×width×seed it
+trains a matched Adam/SGD pair (identical init) tracking the exact region count every epoch.
+
+```bash
+uv run python run_region_sweep.py --depths 1 2 3 4 --widths 16 32 64 128 --seeds 5 --epochs 60
+uv run python analysis_region_sweep.py --save figs   # trajectory grid, vs-arch, gap heatmap, acc parity
+```
+
+Output → `results_regions/`, one record per (depth, width, seed, optimizer) with the per-epoch
+region trajectory + final regions + test metric. Flushed per cell (resumable); CPU by default.
+
+## Causal-mediation study (`run_causal_sweep.py`)
+
+Turns the correlational region↔compressibility story into a **causal** one on bullseye. Instead of
+only varying the optimizer, it **intervenes** on region count with four knobs that are *not* the
+optimizer — weight decay, input noise (`--noises`), learning rate (`--lr_mults`), label noise
+(`apply_label_noise`, flips a fraction of labels) — in a one-knob-at-a-time design, then checks
+that the downstream costs track region count regardless of what produced it.
+
+Per model it records: region count (`grid` exact / `local` / `pairwise`), `lipschitz` (scale
+control), `test_acc`, **compressibility** = one-shot pruning-frontier AUC for `synflow` +
+`balanced`-magnitude (scale-invariant) and raw `magnitude` (scale-sensitive), and
+**verifiability** = mean unstable neurons + IBP certified radius (`verification.py`).
+
+```bash
+uv run python run_causal_sweep.py                     # bullseye: ~140 models, local, minutes
+uv run python analysis_causal.py --save figs          # dose-response + mediation + regression + bins
+```
+
+Works on any classification task. On `mnist`/`cifar10` there is no `input_range`, so the exact
+`grid` metric is `None` and the analysis falls back to `pairwise`/`local`; input noise and
+(multiclass) label noise are applied via dataset wrappers in the driver, and `--train_fraction`
+keeps the benchmarks tractable. For the heavy MNIST+CIFAR sweep use `--seed0` to run one seed per
+job and drive it from SLURM: `slurm/causal_sweep.sbatch` is a MIT-Engaging array script (indices
+0–4 = MNIST seeds, 5–9 = CIFAR seeds), each task writing its own JSON to
+`results_causal_{task}/` (flush-per-model → resumable). Pool per task with
+`analysis_causal.py results_causal_mnist/*.json`.
+
+Identification: scale-invariant outcomes remove Lipschitz from the outcome side; the multi-knob
+population decorrelates region count from Lipschitz; `analysis_causal.py` confirms via **partial
+regression** (outcome ~ region + lipschitz) that region count keeps independent predictive power,
+a **shared-trend mediation scatter** (Adam & SGD on one curve ⇒ optimizer acts only via regions),
+and a **matched-region-bin** test (gap vanishes at equal region count ⇒ full mediation). Output →
+`results_causal/`, flushed per model.
