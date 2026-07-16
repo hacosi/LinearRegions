@@ -17,12 +17,8 @@
 #SBATCH --time=10:00:00
 #SBATCH --output=logs/causal_%A_%a.out
 #SBATCH --error=logs/causal_%A_%a.err
-# ---- EDIT for your Engaging allocation ----
-#SBATCH --partition=mit_normal        # e.g. mit_normal, sched_mit_hill, newnodes
-# #SBATCH --account=<your_account>
-# ---- For faster training on a GPU node, uncomment: ----
-# #SBATCH --gres=gpu:1
-# #SBATCH --partition=mit_normal_gpu
+#SBATCH --partition=mit_normal_gpu
+#SBATCH --gres=gpu:1
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
