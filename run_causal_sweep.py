@@ -191,9 +191,19 @@ def verify_model(model, test_ds, task_info, args):
             "n_verify": len(pts)}
 
 
+def resolve_device(name):
+    if name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(name)
+
+
 def main():
     args = parse_args()
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
     settings = settings_grid(args)
     seed_range = range(args.seed0, args.seed0 + args.seeds)
     total = len(settings) * len(args.optimizers) * args.seeds
